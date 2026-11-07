@@ -82,7 +82,167 @@ function twoVenueGraph(withDestinationInventory: boolean) {
 
 const startAvailability = new Map([['gateio', new Decimal('1000')]]);
 
+function roundedCrossVenuePath(minimum = '1') {
+  const graph = buildCrossVenueGraph({
+    markets: [
+      {
+        venueId: 'gateio',
+        market: {
+          ...market('gateio', 'AAA', 'USDT', '0'),
+          amountStep: new Decimal(1),
+          minNotional: new Decimal(minimum),
+        },
+        book: book('gateio', 'AAA', 'USDT', '6', '5.9'),
+      },
+      {
+        venueId: 'mecx',
+        market: market('mecx', 'AAA', 'USDT', '0'),
+        book: book('mecx', 'AAA', 'USDT', '13.1', '13'),
+      },
+    ],
+    balances: [
+      { venueId: 'gateio', currency: 'USDT', free: new Decimal(10) },
+      { venueId: 'mecx', currency: 'AAA', free: new Decimal(100) },
+    ],
+  });
+  return enumerateCrossVenuePaths(graph, { startCurrency: 'USDT' }).find(
+    (candidate) =>
+      candidate.nodes.map((node) => node.venueId).join('>') === 'gateio>gateio>mecx>mecx',
+  )!;
+}
+
 describe('cross-venue inventory discovery', () => {
+  it.each([
+    ['3', false],
+    ['5', true],
+  ])('preserves exact-minimum budget fills at ask=%s without amount reduction', (ask, hasStep) => {
+    const path = roundedCrossVenuePath('10');
+    const firstLeg = path.legs[0]!;
+    if (firstLeg.kind !== 'trade') throw new Error('expected buy leg');
+    if (!hasStep) delete firstLeg.market.amountStep;
+    firstLeg.book.asks[0]!.price = new Decimal(ask);
+    firstLeg.book.bids[0]!.price = new Decimal(ask).minus('0.1');
+    const result = evaluateCrossVenuePath(path, new Decimal(10), settings, now, health);
+    expect(result.valid).toBe(true);
+    expect((result.fillQuality!.legs as unknown[])[0]).toMatchObject({
+      inputAmount: '10',
+      unspentInputAmount: '0',
+    });
+  });
+
+  it('retains intermediate quote dust without adding it to starting cash or the next trade', () => {
+    const path = roundedCrossVenuePath();
+    const from = path.nodes[2]!;
+    const intermediate = { venueId: 'mecx', currency: 'BBB' };
+    const to = path.nodes[3]!;
+    path.nodes.splice(3, 0, intermediate);
+    path.legs.splice(
+      2,
+      1,
+      {
+        kind: 'trade',
+        from,
+        to: intermediate,
+        side: 'buy',
+        rate: new Decimal(4),
+        market: {
+          ...market('mecx', 'BBB', 'AAA', '0'),
+          amountStep: new Decimal(3),
+          minNotional: new Decimal('0.1'),
+        },
+        book: book('mecx', 'BBB', 'AAA', '0.25', '0.24'),
+      },
+      {
+        kind: 'trade',
+        from: intermediate,
+        to,
+        side: 'sell',
+        rate: new Decimal('6.5'),
+        market: market('mecx', 'BBB', 'USDT', '0'),
+        book: book('mecx', 'BBB', 'USDT', '6.6', '6.5'),
+      },
+    );
+    const simulation = simulateCrossVenuePath(path, new Decimal(10), settings, now, true);
+    expect(simulation.reasons).toEqual([]);
+    expect(simulation.fills[2]!.inputAmount.toFixed()).toBe('0.75');
+    expect(simulation.fills[2]!.unspentInputAmount!.toFixed()).toBe('0.25');
+    expect(simulation.fills[3]!.inputAmount.toFixed()).toBe('3');
+    expect(simulation.outputAmount.toFixed()).toBe('23.5');
+  });
+
+  it.each([
+    ['100', '100000', 'amount_precision_invalid', 0],
+    ['1', '1', 'insufficient_depth', 3],
+  ] as const)('handles step=%s and available base=%s', (step, available, reason, fillCount) => {
+    const path = roundedCrossVenuePath();
+    const firstLeg = path.legs[0]!;
+    if (firstLeg.kind !== 'trade') throw new Error('expected buy leg');
+    firstLeg.market.amountStep = new Decimal(step);
+    firstLeg.book.asks[0]!.amount = new Decimal(available);
+    const simulation = simulateCrossVenuePath(path, new Decimal(10), settings, now, true);
+    expect(simulation.reasons).toContain(reason);
+    expect(simulation.fills).toHaveLength(fillCount);
+  });
+
+  it.each([
+    ['10', false],
+    ['6', true],
+    ['5', true],
+  ])('checks the rounded buy against minNotional=%s', (minimum, valid) => {
+    const path = roundedCrossVenuePath(minimum);
+    const result = evaluateCrossVenuePath(path, new Decimal(10), settings, now, health);
+    expect(result.valid).toBe(valid);
+    expect(result.rejectionReasons.includes('below_min_notional')).toBe(!valid);
+    expect((result.fillQuality!.legs as unknown[])[0]).toMatchObject({
+      inputAmount: '6',
+      outputAmount: '1',
+      unspentInputAmount: '4',
+    });
+    const simulation = simulateCrossVenuePath(path, new Decimal(10), settings, now, true);
+    expect(simulation.outputAmount.toFixed()).toBe('17');
+    expect(result.depthNetProfit.toFixed()).toBe('7');
+  });
+
+  it.each([
+    ['1', '4', '4', 1, '6'],
+    ['0.5', '6', '8', 2, '4'],
+  ])(
+    'reprices rounded multi-level buys with first-level amount=%s',
+    (firstLevelAmount, cost, worstPrice, levelsConsumed, remainder) => {
+      const graph = twoVenueGraph(true);
+      const path = enumerateCrossVenuePaths(graph, { startCurrency: 'USDT' }).find(
+        (candidate) =>
+          candidate.nodes.map((node) => node.venueId).join('>') === 'gateio>gateio>mecx>mecx',
+      )!;
+      const firstLeg = path.legs[0]!;
+      if (firstLeg.kind !== 'trade') throw new Error('expected buy leg');
+      firstLeg.market.amountStep = new Decimal(1);
+      firstLeg.market.feeTakerBps = new Decimal(100);
+      firstLeg.book.bids[0]!.price = new Decimal('3.9');
+      firstLeg.book.asks = [
+        { price: new Decimal(4), amount: new Decimal(firstLevelAmount) },
+        { price: new Decimal(8), amount: new Decimal(10) },
+      ];
+      const inventoryLeg = path.legs[1]!;
+      if (inventoryLeg.kind !== 'inventory') throw new Error('expected inventory leg');
+      inventoryLeg.available = new Decimal('0.99');
+      const simulation = simulateCrossVenuePath(path, new Decimal(10), settings, now, true);
+      const first = simulation.fills[0]!;
+      expect(first.inputAmount.toFixed()).toBe(cost);
+      expect(first.averagePrice!.toFixed()).toBe(cost);
+      expect(first.worstPrice!.toFixed()).toBe(worstPrice);
+      expect(first.levelsConsumed).toBe(levelsConsumed);
+      expect(first.fee.toFixed()).toBe('0.01');
+      expect(first.outputAmount.toFixed()).toBe('0.99');
+      expect(simulation.reasons).not.toContain('insufficient_inventory');
+      expect(simulation.fills[1]!.inputAmount.toFixed()).toBe('0.99');
+      expect(simulation.outputAmount.minus(simulation.fills.at(-1)!.outputAmount).toFixed()).toBe(
+        remainder,
+      );
+      expect(first.inputAmount.plus(remainder).toFixed()).toBe('10');
+    },
+  );
+
   it('finds and validates a two-venue inventory path', () => {
     const graph = twoVenueGraph(true);
     const paths = enumerateCrossVenuePaths(graph, {

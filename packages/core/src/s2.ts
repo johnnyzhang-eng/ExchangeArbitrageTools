@@ -5,7 +5,11 @@ import {
   calculateSafetyBuffer,
   bps as toBps,
 } from './money.js';
-import { calculateBuyDepthByQuote, calculateSellDepthByBase } from './depth.js';
+import {
+  calculateBuyDepthByBase,
+  calculateBuyDepthByQuote,
+  calculateSellDepthByBase,
+} from './depth.js';
 import { alignAmountDown } from './precision.js';
 import { validateOrderBook } from './orderbook.js';
 import { searchOptimalNotional } from './optimal.js';
@@ -34,6 +38,8 @@ export interface TriangularFill {
   venueId: string;
   symbol: string;
   inputAmount: Decimal;
+  /** Quote currency retained at this venue after rounding a buy order. */
+  unspentInputAmount?: Decimal;
   outputAmount: Decimal;
   fee: Decimal;
   feeCurrency: string;
@@ -44,6 +50,7 @@ export interface TriangularFill {
 }
 
 export interface TriangularSimulation {
+  /** Terminal proceeds plus retained starting-currency cash; other residual currencies are unvalued. */
   outputAmount: Decimal;
   fills: TriangularFill[];
   reasons: RejectionReason[];
@@ -247,6 +254,8 @@ function simulateChain(
   const reasons: RejectionReason[] = [];
   const fills: TriangularFill[] = [];
   let amount = startAmount;
+  // Only retained starting currency can be added to the terminal cash balance without conversion.
+  let unspentStartAmount = ZERO;
   let dataAgeMs = 0;
   if (!startAmount.isFinite() || startAmount.lte(0) || !Number.isFinite(now) || now <= 0) {
     reasons.push('invalid_request');
@@ -366,15 +375,26 @@ function simulateChain(
         insufficientDepth: depth.insufficientDepth,
       });
     } else {
-      if (edge.market.minNotional && amount.lt(edge.market.minNotional)) {
+      const budgetDepth = calculateBuyDepthByQuote(validation.book, amount);
+      if (budgetDepth.insufficientDepth) reasons.push('insufficient_depth');
+      const grossOutput = edge.market.amountStep
+        ? alignAmountDown(budgetDepth.executableBaseAmount, edge.market.amountStep)
+        : budgetDepth.executableBaseAmount;
+      if (!grossOutput.gt(0)) {
+        reasons.push('amount_precision_invalid');
+        return { outputAmount: ZERO, fills, reasons, dataAgeMs };
+      }
+      // Preserve the exact quote budget when alignment did not reduce the order.
+      const depth = grossOutput.eq(budgetDepth.executableBaseAmount)
+        ? budgetDepth
+        : calculateBuyDepthByBase(validation.book, grossOutput);
+      if (edge.market.minNotional && depth.executableQuoteAmount.lt(edge.market.minNotional)) {
         reasons.push('below_min_notional');
       }
-      const depth = calculateBuyDepthByQuote(validation.book, amount);
-      if (depth.insufficientDepth) reasons.push('insufficient_depth');
-      const grossOutput = edge.market.amountStep
-        ? alignAmountDown(depth.executableBaseAmount, edge.market.amountStep)
-        : depth.executableBaseAmount;
-      if (!grossOutput.gt(0)) reasons.push('amount_precision_invalid');
+      const unspentInputAmount = amount.minus(depth.executableQuoteAmount);
+      if (from === path.currencies[0]) {
+        unspentStartAmount = unspentStartAmount.plus(unspentInputAmount);
+      }
       if (edge.market.minAmount && grossOutput.lt(edge.market.minAmount)) {
         reasons.push('below_min_notional');
       }
@@ -386,6 +406,7 @@ function simulateChain(
         venueId: edge.market.venueId,
         symbol: edge.market.exchangeSymbol,
         inputAmount: depth.executableQuoteAmount,
+        unspentInputAmount,
         outputAmount: amount,
         fee,
         feeCurrency: edge.market.base,
@@ -400,7 +421,7 @@ function simulateChain(
       return { outputAmount: ZERO, fills, reasons, dataAgeMs };
     }
   }
-  return { outputAmount: amount, fills, reasons, dataAgeMs };
+  return { outputAmount: amount.plus(unspentStartAmount), fills, reasons, dataAgeMs };
 }
 
 export function simulateTriangularPath(
@@ -472,6 +493,9 @@ export function evaluateTriangularPath(
         venueId: fill.venueId,
         symbol: fill.symbol,
         inputAmount: fill.inputAmount.toFixed(),
+        ...(fill.unspentInputAmount !== undefined
+          ? { unspentInputAmount: fill.unspentInputAmount.toFixed() }
+          : {}),
         outputAmount: fill.outputAmount.toFixed(),
         fee: fill.fee.toFixed(),
         feeCurrency: fill.feeCurrency,

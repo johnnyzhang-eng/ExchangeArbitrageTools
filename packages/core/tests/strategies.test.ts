@@ -7,6 +7,7 @@ import {
   evaluateS3,
   evaluateS4,
   evaluateTriangularPath,
+  simulateTriangularPath,
   type CostSettings,
   type DexQuote,
   type MarketMetadata,
@@ -90,7 +91,125 @@ function quote(overrides: Partial<DexQuote> = {}): DexQuote {
   };
 }
 
+function roundedTriangularPath(minimum = '1') {
+  return {
+    currencies: ['USDT', 'AAA', 'BBB', 'USDT'],
+    edges: [
+      {
+        market: {
+          ...market('AAA', 'USDT', '0'),
+          amountStep: new Decimal(1),
+          minNotional: new Decimal(minimum),
+        },
+        book: book('gateio', 'AAA/USDT', '6', '5.9'),
+      },
+      { market: market('BBB', 'AAA', '0'), book: book('gateio', 'BBB/AAA', '0.5', '0.49') },
+      { market: market('BBB', 'USDT', '0'), book: book('gateio', 'BBB/USDT', '6.6', '6.5') },
+    ],
+  };
+}
+
 describe('S2 triangular paths', () => {
+  it.each([
+    ['3', false],
+    ['5', true],
+  ])('preserves exact-minimum budget fills at ask=%s without amount reduction', (ask, hasStep) => {
+    const path = roundedTriangularPath('10');
+    const firstMarket: MarketMetadata = path.edges[0]!.market;
+    if (!hasStep) delete firstMarket.amountStep;
+    path.edges[0]!.book.asks[0]!.price = new Decimal(ask);
+    path.edges[0]!.book.bids[0]!.price = new Decimal(ask).minus('0.1');
+    const result = evaluateTriangularPath(path, new Decimal(10), settings, now);
+    expect(result.valid).toBe(true);
+    expect((result.fillQuality!.fills as unknown[])[0]).toMatchObject({
+      inputAmount: '10',
+      unspentInputAmount: '0',
+    });
+  });
+
+  it('retains intermediate quote dust without treating it as starting currency or next-leg input', () => {
+    const path = roundedTriangularPath();
+    path.edges[1]!.market.amountStep = new Decimal(3);
+    path.edges[1]!.market.minNotional = new Decimal('0.1');
+    path.edges[1]!.book.asks[0]!.price = new Decimal('0.25');
+    path.edges[1]!.book.bids[0]!.price = new Decimal('0.24');
+    const simulation = simulateTriangularPath(path, new Decimal(10), settings, now);
+    expect(simulation.reasons).toEqual([]);
+    expect(simulation.fills[1]!.inputAmount.toFixed()).toBe('0.75');
+    expect(simulation.fills[1]!.unspentInputAmount!.toFixed()).toBe('0.25');
+    expect(simulation.fills[2]!.inputAmount.toFixed()).toBe('3');
+    expect(simulation.outputAmount.toFixed()).toBe('23.5');
+  });
+
+  it.each([
+    ['100', '100000', 'amount_precision_invalid', 0],
+    ['1', '1', 'insufficient_depth', 3],
+  ] as const)('handles step=%s and available base=%s', (step, available, reason, fillCount) => {
+    const path = roundedTriangularPath();
+    path.edges[0]!.market.amountStep = new Decimal(step);
+    path.edges[0]!.book.asks[0]!.amount = new Decimal(available);
+    const simulation = simulateTriangularPath(path, new Decimal(10), settings, now);
+    expect(simulation.reasons).toContain(reason);
+    expect(simulation.fills).toHaveLength(fillCount);
+  });
+
+  it.each([
+    ['10', false],
+    ['6', true],
+    ['5', true],
+  ])('checks the rounded order against minNotional=%s', (minimum, valid) => {
+    const path = roundedTriangularPath(minimum);
+    const result = evaluateTriangularPath(path, new Decimal(10), settings, now);
+    expect(result.valid).toBe(valid);
+    expect(result.rejectionReasons.includes('below_min_notional')).toBe(!valid);
+    expect((result.fillQuality!.fills as unknown[])[0]).toMatchObject({
+      inputAmount: '6',
+      outputAmount: '1',
+      unspentInputAmount: '4',
+    });
+    expect(
+      simulateTriangularPath(path, new Decimal(10), settings, now).outputAmount.toFixed(),
+    ).toBe('17');
+    expect(result.depthNetProfit.toFixed()).toBe('7');
+  });
+
+  it.each([
+    ['1', '4', '4', 1, '6'],
+    ['0.5', '6', '8', 2, '4'],
+  ])(
+    'reprices rounded multi-level buys with first-level amount=%s',
+    (firstLevelAmount, cost, worstPrice, levelsConsumed, remainder) => {
+      const firstBook = book('gateio', 'AAA/USDT', '4', '3.9');
+      firstBook.asks = [
+        { price: new Decimal(4), amount: new Decimal(firstLevelAmount) },
+        { price: new Decimal(8), amount: new Decimal(10) },
+      ];
+      const path = {
+        currencies: ['USDT', 'AAA', 'BBB', 'USDT'],
+        edges: [
+          {
+            market: { ...market('AAA', 'USDT', '100'), amountStep: new Decimal(1) },
+            book: firstBook,
+          },
+          { market: market('BBB', 'AAA', '0'), book: book('gateio', 'BBB/AAA', '0.5', '0.49') },
+          { market: market('BBB', 'USDT', '0'), book: book('gateio', 'BBB/USDT', '6.6', '6.5') },
+        ],
+      };
+      const simulation = simulateTriangularPath(path, new Decimal(10), settings, now);
+      const first = simulation.fills[0]!;
+      expect(first.inputAmount.toFixed()).toBe(cost);
+      expect(first.averagePrice.toFixed()).toBe(cost);
+      expect(first.worstPrice.toFixed()).toBe(worstPrice);
+      expect(first.levelsConsumed).toBe(levelsConsumed);
+      expect(first.fee.toFixed()).toBe('0.01');
+      expect(first.outputAmount.toFixed()).toBe('0.99');
+      expect(simulation.outputAmount.minus(simulation.fills.at(-1)!.outputAmount).toFixed()).toBe(
+        remainder,
+      );
+      expect(first.inputAmount.plus(remainder).toFixed()).toBe('10');
+    },
+  );
+
   it('evaluates sequential depth and rejects stale path data', () => {
     const edges: TriangularEdge[] = [
       { market: market('BNB', 'USDT'), book: book('gateio', 'BNB/USDT', '500', '499') },

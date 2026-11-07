@@ -5,7 +5,11 @@ import {
   calculateSafetyBuffer,
   minDecimal,
 } from './money.js';
-import { calculateBuyDepthByQuote, calculateSellDepthByBase } from './depth.js';
+import {
+  calculateBuyDepthByBase,
+  calculateBuyDepthByQuote,
+  calculateSellDepthByBase,
+} from './depth.js';
 import { alignAmountDown } from './precision.js';
 import { validateOrderBook } from './orderbook.js';
 import { searchOptimalNotional } from './optimal.js';
@@ -72,6 +76,8 @@ export interface CrossVenueFill {
   toVenue: string;
   toCurrency: string;
   inputAmount: Decimal;
+  /** Quote currency retained at fromVenue after rounding a buy order. */
+  unspentInputAmount?: Decimal;
   outputAmount: Decimal;
   fee: Decimal;
   symbol?: string;
@@ -83,6 +89,7 @@ export interface CrossVenueFill {
 }
 
 export interface CrossVenueSimulation {
+  /** Terminal proceeds plus retained starting currency across venues, not terminal-venue availability. */
   outputAmount: Decimal;
   fills: CrossVenueFill[];
   reasons: RejectionReason[];
@@ -341,6 +348,8 @@ export function simulateCrossVenuePath(
   const reasons: RejectionReason[] = [];
   const fills: CrossVenueFill[] = [];
   let amount = startAmount;
+  // Sum starting currency across venues; residual cash never enters the inventory leg.
+  let unspentStartAmount = ZERO;
   let dataAgeMs = 0;
   if (!startAmount.isFinite() || startAmount.lte(0) || !Number.isFinite(now) || now <= 0) {
     reasons.push('invalid_request');
@@ -461,15 +470,26 @@ export function simulateCrossVenuePath(
         levelsConsumed: depth.levelsConsumed,
       });
     } else {
-      if (leg.market.minNotional && amount.lt(leg.market.minNotional)) {
+      const budgetDepth = calculateBuyDepthByQuote(validation.book, amount);
+      if (budgetDepth.insufficientDepth) reasons.push('insufficient_depth');
+      const grossOutput = leg.market.amountStep
+        ? alignAmountDown(budgetDepth.executableBaseAmount, leg.market.amountStep)
+        : budgetDepth.executableBaseAmount;
+      if (!grossOutput.gt(0)) {
+        reasons.push('amount_precision_invalid');
+        return { outputAmount: ZERO, fills, reasons, dataAgeMs };
+      }
+      // Preserve the exact quote budget when alignment did not reduce the order.
+      const depth = grossOutput.eq(budgetDepth.executableBaseAmount)
+        ? budgetDepth
+        : calculateBuyDepthByBase(validation.book, grossOutput);
+      if (leg.market.minNotional && depth.executableQuoteAmount.lt(leg.market.minNotional)) {
         reasons.push('below_min_notional');
       }
-      const depth = calculateBuyDepthByQuote(validation.book, amount);
-      if (depth.insufficientDepth) reasons.push('insufficient_depth');
-      const grossOutput = leg.market.amountStep
-        ? alignAmountDown(depth.executableBaseAmount, leg.market.amountStep)
-        : depth.executableBaseAmount;
-      if (!grossOutput.gt(0)) reasons.push('amount_precision_invalid');
+      const unspentInputAmount = amount.minus(depth.executableQuoteAmount);
+      if (from.currency === firstCurrency) {
+        unspentStartAmount = unspentStartAmount.plus(unspentInputAmount);
+      }
       if (leg.market.minAmount && grossOutput.lt(leg.market.minAmount)) {
         reasons.push('below_min_notional');
       }
@@ -482,6 +502,7 @@ export function simulateCrossVenuePath(
         toVenue: to.venueId,
         toCurrency: to.currency,
         inputAmount: depth.executableQuoteAmount,
+        unspentInputAmount,
         outputAmount: amount,
         fee,
         symbol: leg.market.exchangeSymbol,
@@ -496,7 +517,7 @@ export function simulateCrossVenuePath(
       return { outputAmount: ZERO, fills, reasons, dataAgeMs };
     }
   }
-  return { outputAmount: amount, fills, reasons, dataAgeMs };
+  return { outputAmount: amount.plus(unspentStartAmount), fills, reasons, dataAgeMs };
 }
 
 export function evaluateCrossVenuePath(
@@ -578,6 +599,9 @@ export function evaluateCrossVenuePath(
         toVenue: fill.toVenue,
         toCurrency: fill.toCurrency,
         inputAmount: fill.inputAmount.toFixed(),
+        ...(fill.unspentInputAmount !== undefined
+          ? { unspentInputAmount: fill.unspentInputAmount.toFixed() }
+          : {}),
         outputAmount: fill.outputAmount.toFixed(),
         fee: fill.fee.toFixed(),
         ...(fill.symbol ? { symbol: fill.symbol } : {}),
